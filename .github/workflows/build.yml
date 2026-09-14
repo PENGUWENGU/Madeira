@@ -1,23 +1,37 @@
 name: Build Madeira IPA
-on: [workflow_dispatch] # Allows you to manually click "Build"
+on: [workflow_dispatch]
 
 jobs:
   build:
-    runs-on: macos-14 # Tells GitHub to use a cloud Mac computer
+    runs-on: macos-14
     steps:
-      - name: Checkout Code
+      - name: Checkout Code with Submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Setup Dependencies
+      - name: Install Mac Dependencies
         run: |
           brew install llvm ninja cmake
 
-      - name: Run Builder Script
+      - name: Compile Backend Translation Layers
         run: |
-          chmod +x ./scripts/build-ipa.sh
-          ./scripts/build-ipa.sh
+          chmod +x ./build/wine/build.sh
+          chmod +x ./build/fex/build.sh
+          chmod +x ./build/dxmt/build.sh
+          ./build/wine/build.sh
+          ./build/fex/build.sh
+          ./build/dxmt/build.sh
+
+      - name: Build the iOS App Bundle
+        run: |
+          xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -configuration Release -derivedDataPath build_output
+
+      - name: Package App into IPA Archive
+        run: |
+          mkdir -p dist/Payload
+          cp -r build_output/Build/Products/Release-iphoneos/Madeira.app dist/Payload/
+          cd dist && zip -r Madeira.ipa Payload/
 
       - name: Upload Finished IPA
         uses: actions/upload-artifact@v4
