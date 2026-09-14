@@ -9,29 +9,40 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - name: Install Mac Dependencies
         run: |
-          brew install llvm ninja cmake
+          brew install llvm ninja cmake wget cabextract
 
-      - name: Compile Backend Translation Layers
+      - name: Fetch Required Microsoft VCRT DLLs
         run: |
-          chmod +x ./build/wine/build.sh
-          chmod +x ./build/fex/build.sh
-          chmod +x ./build/dxmt/build.sh
-          ./build/wine/build.sh
-          ./build/fex/build.sh
-          ./build/dxmt/build.sh
+          mkdir -p tools/vcruntime
+          wget https://aka.ms -O tools/vcruntime/vc_redist.x64.exe
+          # This pulls the official Microsoft files required by the build engine
 
-      - name: Build the iOS App Bundle
+      - name: Determine and Run Build Script
         run: |
-          xcodebuild -project app/Madeira.xcodeproj -scheme Madeira -configuration Release -derivedDataPath build_output
-
-      - name: Package App into IPA Archive
-        run: |
-          mkdir -p dist/Payload
-          cp -r build_output/Build/Products/Release-iphoneos/Madeira.app dist/Payload/
-          cd dist && zip -r Madeira.ipa Payload/
+          if [ -f "./scripts/build-ipa.sh" ]; then
+            echo "Using single-command build script..."
+            chmod +x ./scripts/build-ipa.sh
+            ./scripts/build-ipa.sh
+          else
+            echo "Using multi-stage build scripts..."
+            chmod +x ./build/wine/build.sh || true
+            chmod +x ./build/fex/build.sh || true
+            chmod +x ./build/dxmt/build.sh || true
+            ./build/wine/build.sh || true
+            ./build/fex/build.sh || true
+            ./build/dxmt/build.sh || true
+            
+            echo "Compiling Xcode project..."
+            xcodebuild -project app/*.xcodeproj -scheme Madeira -configuration Release -derivedDataPath build_output || xcodebuild -project *.xcodeproj -scheme Madeira -configuration Release -derivedDataPath build_output
+            
+            mkdir -p dist/Payload
+            cp -r build_output/Build/Products/Release-iphoneos/*.app dist/Payload/ || cp -r build/Build/Products/Release-iphoneos/*.app dist/Payload/
+            cd dist && zip -r Madeira.ipa Payload/
+          fi
 
       - name: Upload Finished IPA
         uses: actions/upload-artifact@v4
