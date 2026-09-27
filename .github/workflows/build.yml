@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout Madeira
@@ -15,7 +15,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           brew update
           brew install \
@@ -29,46 +29,83 @@ jobs:
             nasm \
             python
 
-      - name: Show Xcode version
+      - name: Install LLVM-MinGW
+        shell: bash
         run: |
-          xcodebuild -version
-          xcode-select -p
+          set -e
+
+          TOOLCHAIN_VERSION="20260421"
+          TOOLCHAIN_NAME="llvm-mingw-${TOOLCHAIN_VERSION}-ucrt-macos-universal"
+
+          mkdir -p toolchains
+          cd toolchains
+
+          curl -fL \
+            -o llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${TOOLCHAIN_VERSION}/${TOOLCHAIN_NAME}.tar.xz"
+
+          tar -xf llvm-mingw.tar.xz
+          rm llvm-mingw.tar.xz
+
+          cd ..
+
+          test -x "toolchains/${TOOLCHAIN_NAME}/bin/x86_64-w64-mingw32-clang"
+
+          echo "LLVM-MinGW installed:"
+          "toolchains/${TOOLCHAIN_NAME}/bin/x86_64-w64-mingw32-clang" --version
+
+      - name: Show repository structure
+        shell: bash
+        run: |
+          echo "Build scripts:"
+          find build -name "build.sh" -type f -print
+
+          echo ""
+          echo "Xcode projects:"
+          find . \
+            \( -name "*.xcodeproj" -o -name "*.xcworkspace" \) \
+            -not -path "./.git/*" \
+            -print
 
       - name: Make build scripts executable
+        shell: bash
         run: |
-          find build -name build.sh -type f -exec chmod +x {} \;
+          find build -name "build.sh" -type f -exec chmod +x {} \;
 
-      - name: Build native Madeira components
+      - name: Build Madeira native components
         shell: bash
         run: |
           set -e
 
           for script in build/*/build.sh; do
             echo "========================================"
-            echo "Building: $script"
+            echo "Building $script"
             echo "========================================"
+
             "$script"
           done
 
-      - name: Find Xcode project
+      - name: Find iOS project
         shell: bash
         run: |
-          echo "Projects:"
-          find . \
-            \( -name "*.xcodeproj" -o -name "*.xcworkspace" \) \
-            -not -path "./.git/*" \
-            -print
+          set -e
 
-      - name: List Xcode schemes
-        shell: bash
-        run: |
-          PROJECT=$(find . -name "*.xcodeproj" -not -path "./.git/*" | head -n 1)
+          PROJECT=$(find . \
+            -name "*.xcodeproj" \
+            -not -path "./.git/*" \
+            | head -n 1)
 
           if [ -z "$PROJECT" ]; then
-            echo "No Xcode project found"
+            echo "ERROR: No Xcode project found."
             exit 1
           fi
 
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          echo "Found: $PROJECT"
+
+      - name: Show Xcode schemes
+        shell: bash
+        run: |
           xcodebuild \
             -project "$PROJECT" \
             -list
@@ -78,14 +115,7 @@ jobs:
         run: |
           set -e
 
-          PROJECT=$(find . -name "*.xcodeproj" -not -path "./.git/*" | head -n 1)
-
-          if [ -z "$PROJECT" ]; then
-            echo "No Xcode project found"
-            exit 1
-          fi
-
-          mkdir -p build/DerivedData
+          rm -rf build/DerivedData
 
           xcodebuild \
             -project "$PROJECT" \
@@ -96,41 +126,46 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build
 
-      - name: Locate application
-        shell: bash
-        run: |
-          find build/DerivedData \
-            -name "*.app" \
-            -type d \
-            -print
-
-      - name: Package IPA
+      - name: Find built app
         shell: bash
         run: |
           set -e
 
           APP=$(find build/DerivedData \
-            -path "*Release-iphoneos/*.app" \
-            -type d | head -n 1)
+            -path "*/Build/Products/Release-iphoneos/*.app" \
+            -type d \
+            | head -n 1)
 
           if [ -z "$APP" ]; then
-            echo "No .app was produced"
+            echo "ERROR: No .app was produced."
+            find build/DerivedData -name "*.app" -print
             exit 1
           fi
 
-          rm -rf Payload
-          mkdir -p Payload
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "Found app:"
+          echo "$APP"
+
+      - name: Create IPA
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf ipa Payload
+          mkdir -p Payload ipa
+
           cp -R "$APP" Payload/
 
-          mkdir -p artifacts
-
           cd Payload
-          zip -r ../artifacts/Madeira-unsigned.ipa *.app
+          zip -r ../ipa/Madeira-unsigned.ipa *.app
           cd ..
+
+          echo "IPA created:"
+          ls -lh ipa/Madeira-unsigned.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: Madeira-IPA
-          path: artifacts/Madeira-unsigned.ipa
+          path: ipa/Madeira-unsigned.ipa
           if-no-files-found: error
