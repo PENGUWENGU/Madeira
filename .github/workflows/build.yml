@@ -1,1 +1,136 @@
-git clone --recurse-submodules https://github.com/willfaust/Madeira.gitcd Madeira./scripts/build-ipa.sh # produces dist/Madeira.ipa
+name: Build Madeira IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Madeira
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install \
+            cmake \
+            ninja \
+            meson \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            nasm \
+            python
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Make build scripts executable
+        run: |
+          find build -name build.sh -type f -exec chmod +x {} \;
+
+      - name: Build native Madeira components
+        shell: bash
+        run: |
+          set -e
+
+          for script in build/*/build.sh; do
+            echo "========================================"
+            echo "Building: $script"
+            echo "========================================"
+            "$script"
+          done
+
+      - name: Find Xcode project
+        shell: bash
+        run: |
+          echo "Projects:"
+          find . \
+            \( -name "*.xcodeproj" -o -name "*.xcworkspace" \) \
+            -not -path "./.git/*" \
+            -print
+
+      - name: List Xcode schemes
+        shell: bash
+        run: |
+          PROJECT=$(find . -name "*.xcodeproj" -not -path "./.git/*" | head -n 1)
+
+          if [ -z "$PROJECT" ]; then
+            echo "No Xcode project found"
+            exit 1
+          fi
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -list
+
+      - name: Build iOS app
+        shell: bash
+        run: |
+          set -e
+
+          PROJECT=$(find . -name "*.xcodeproj" -not -path "./.git/*" | head -n 1)
+
+          if [ -z "$PROJECT" ]; then
+            echo "No Xcode project found"
+            exit 1
+          fi
+
+          mkdir -p build/DerivedData
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Locate application
+        shell: bash
+        run: |
+          find build/DerivedData \
+            -name "*.app" \
+            -type d \
+            -print
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -e
+
+          APP=$(find build/DerivedData \
+            -path "*Release-iphoneos/*.app" \
+            -type d | head -n 1)
+
+          if [ -z "$APP" ]; then
+            echo "No .app was produced"
+            exit 1
+          fi
+
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+
+          mkdir -p artifacts
+
+          cd Payload
+          zip -r ../artifacts/Madeira-unsigned.ipa *.app
+          cd ..
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-IPA
+          path: artifacts/Madeira-unsigned.ipa
+          if-no-files-found: error
