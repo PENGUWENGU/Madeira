@@ -1,4 +1,4 @@
-name: Build Madeira IPA
+name: Build Madeira Unsigned IPA
 
 on:
   workflow_dispatch:
@@ -8,41 +8,28 @@ permissions:
 
 jobs:
   build:
-    # Madeira's native build chain is safer on Intel.
     runs-on: macos-15-intel
     timeout-minutes: 360
 
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-      LLVM_MINGW_VERSION: "20260421"
-      LLVM_MINGW_NAME: "llvm-mingw-20260421-ucrt-macos-universal"
-
     steps:
-      - name: Checkout Madeira
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
+          submodules: recursive
 
-      - name: Select Xcode
-        shell: bash
+      - name: Show environment
         run: |
           set -euxo pipefail
 
-          if [ ! -d "$DEVELOPER_DIR" ]; then
-            echo "Xcode 16.4 was not found:"
-            ls -la /Applications | grep -i Xcode || true
-            exit 1
-          fi
-
-          xcode-select -s "$DEVELOPER_DIR"
+          uname -a
+          uname -m
 
           xcodebuild -version
+          xcode-select -p
           xcrun --sdk iphoneos --show-sdk-version
-          xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Install build dependencies
-        shell: bash
+      - name: Install dependencies
         run: |
           set -euxo pipefail
 
@@ -58,87 +45,89 @@ jobs:
             python \
             gettext \
             bison \
-            flex \
-            zip
+            flex
 
       - name: Install LLVM-MinGW
         shell: bash
         run: |
           set -euxo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/toolchains"
+          VERSION="20260421"
+          NAME="llvm-mingw-${VERSION}-ucrt-macos-universal"
 
-          cd "$GITHUB_WORKSPACE/toolchains"
+          mkdir -p "$RUNNER_TEMP/llvm-mingw"
+          cd "$RUNNER_TEMP/llvm-mingw"
 
-          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${LLVM_MINGW_NAME}.tar.xz"
-
-          curl --fail --location --retry 5 \
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 3 \
             -o llvm-mingw.tar.xz \
-            "$URL"
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${VERSION}/${NAME}.tar.xz"
 
           tar -xf llvm-mingw.tar.xz
-          rm llvm-mingw.tar.xz
 
-          TOOLCHAIN="$GITHUB_WORKSPACE/toolchains/$LLVM_MINGW_NAME"
+          TOOLCHAIN="$RUNNER_TEMP/llvm-mingw/$NAME"
 
           test -x "$TOOLCHAIN/bin/x86_64-w64-mingw32-clang"
+          test -x "$TOOLCHAIN/bin/x86_64-w64-mingw32-clang++"
 
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
-
-          echo "LLVM_MINGW_PATH=$TOOLCHAIN" >> "$GITHUB_ENV"
-          echo "LLVM_MINGW_ROOT=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "LLVM_MINGW=$TOOLCHAIN" >> "$GITHUB_ENV"
 
           "$TOOLCHAIN/bin/x86_64-w64-mingw32-clang" --version
 
-      - name: Prepare build environment
-        shell: bash
+      - name: Verify submodules
         run: |
           set -euxo pipefail
 
-          export PATH="$LLVM_MINGW_PATH/bin:$PATH"
-
-          echo "PATH:"
-          echo "$PATH"
-
-          echo
-          echo "LLVM-MinGW:"
-          command -v x86_64-w64-mingw32-clang
-          command -v x86_64-w64-mingw32-clang++
-
-          echo
-          echo "Repository:"
-          git status --short
-
-          echo
-          echo "Submodules:"
           git submodule status
 
-      - name: Make build scripts executable
-        shell: bash
-        run: |
-          set -euxo pipefail
+          test -d FEX
+          test -d wine
+          test -d research/dxmt
 
-          find build -type f -name "build.sh" -exec chmod +x {} \;
-
-      - name: Show build scripts
-        shell: bash
+      - name: Find build scripts
         run: |
           set -euxo pipefail
 
           find build \
             -type f \
-            -name "build.sh" \
+            -name build.sh \
             -print \
             | sort
 
-      - name: Build Madeira native components
+      - name: Make build scripts executable
+        run: |
+          set -euxo pipefail
+
+          find build \
+            -type f \
+            -name build.sh \
+            -exec chmod +x {} \;
+
+      - name: Build native components
         shell: bash
         run: |
           set -euxo pipefail
 
-          export PATH="$LLVM_MINGW_PATH/bin:$PATH"
+          export PATH="$LLVM_MINGW/bin:$PATH"
 
-          for script in $(find build -type f -name "build.sh" | sort); do
+          mapfile -t SCRIPTS < <(
+            find build \
+              -type f \
+              -name build.sh \
+              -print \
+              | sort
+          )
+
+          if [ "${#SCRIPTS[@]}" -eq 0 ]; then
+            echo "ERROR: No build scripts found."
+            exit 1
+          fi
+
+          for script in "${SCRIPTS[@]}"; do
             echo
             echo "=============================================="
             echo "BUILDING: $script"
@@ -147,14 +136,12 @@ jobs:
             "$GITHUB_WORKSPACE/$script"
           done
 
-      - name: Verify native libraries
+      - name: Check generated libraries
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "Checking libraries referenced by Madeira..."
-
-          REQUIRED_FILES=(
+          REQUIRED=(
             "FEX/build-ios/FEXCore/Source/libFEXCore.a"
             "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a"
             "FEX/build-ios/FEXCore/Source/libJemallocLibs.a"
@@ -172,27 +159,16 @@ jobs:
             "app/libgmp.a"
           )
 
-          FAILED=0
-
-          for file in "${REQUIRED_FILES[@]}"; do
-            if [ ! -e "$file" ]; then
+          for file in "${REQUIRED[@]}"; do
+            if [ ! -f "$file" ]; then
               echo "MISSING: $file"
-              FAILED=1
-            else
-              echo "OK: $file"
+              exit 1
             fi
+
+            echo "OK: $file"
           done
 
-          if [ "$FAILED" -ne 0 ]; then
-            echo
-            echo "One or more required native libraries are missing."
-            echo "Contents of app/:"
-            find app -maxdepth 2 -type f | sort || true
-            exit 1
-          fi
-
-      - name: Show Xcode project
-        shell: bash
+      - name: Verify Xcode project
         run: |
           set -euxo pipefail
 
@@ -202,12 +178,12 @@ jobs:
             -project app/Madeira.xcodeproj \
             -list
 
-      - name: Build Madeira
+      - name: Build Madeira app
         shell: bash
         run: |
           set -euxo pipefail
 
-          rm -rf build/DerivedData
+          rm -rf "$RUNNER_TEMP/MadeiraDerivedData"
 
           xcodebuild \
             -project app/Madeira.xcodeproj \
@@ -215,7 +191,7 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -arch arm64 \
-            -derivedDataPath "$GITHUB_WORKSPACE/build/DerivedData" \
+            -derivedDataPath "$RUNNER_TEMP/MadeiraDerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -223,68 +199,60 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             build
 
-      - name: Locate Madeira.app
+      - name: Verify Madeira.app
         shell: bash
         run: |
           set -euxo pipefail
 
-          APP="$GITHUB_WORKSPACE/build/DerivedData/Build/Products/Release-iphoneos/Madeira.app"
+          APP="$RUNNER_TEMP/MadeiraDerivedData/Build/Products/Release-iphoneos/Madeira.app"
 
-          if [ ! -d "$APP" ]; then
-            echo "Madeira.app was not produced."
+          test -d "$APP"
+          test -f "$APP/Madeira"
 
-            find "$GITHUB_WORKSPACE/build/DerivedData" \
-              -name "*.app" \
-              -print || true
-
-            exit 1
-          fi
+          file "$APP/Madeira"
+          lipo -info "$APP/Madeira"
 
           echo "APP=$APP" >> "$GITHUB_ENV"
-
-          echo
-          echo "Found:"
-          ls -lah "$APP"
-
-      - name: Verify app architecture
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          APP_BINARY="$APP/Madeira"
-
-          test -f "$APP_BINARY"
-
-          file "$APP_BINARY"
-          lipo -info "$APP_BINARY"
 
       - name: Create unsigned IPA
         shell: bash
         run: |
           set -euxo pipefail
 
-          rm -rf ipa Payload
-          mkdir -p ipa Payload
+          rm -rf "$RUNNER_TEMP/Payload"
+          mkdir -p "$RUNNER_TEMP/Payload"
 
-          cp -R "$APP" Payload/Madeira.app
+          cp -R "$APP" "$RUNNER_TEMP/Payload/Madeira.app"
 
-          (
-            cd Payload
-            /usr/bin/zip -qry \
-              "$GITHUB_WORKSPACE/ipa/Madeira-unsigned.ipa" \
-              Madeira.app
-          )
+          cd "$RUNNER_TEMP"
 
-          test -f ipa/Madeira-unsigned.ipa
+          /usr/bin/zip \
+            -qry \
+            "$GITHUB_WORKSPACE/Madeira-unsigned.ipa" \
+            Payload
+
+          test -f "$GITHUB_WORKSPACE/Madeira-unsigned.ipa"
+
+      - name: Validate IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          unzip -t Madeira-unsigned.ipa
+
+          unzip -l Madeira-unsigned.ipa | grep "Payload/Madeira.app/"
 
           echo
-          echo "IPA:"
-          ls -lh ipa/Madeira-unsigned.ipa
+          echo "=============================================="
+          echo "SUCCESS"
+          echo "=============================================="
 
-      - name: Upload IPA
+          ls -lh Madeira-unsigned.ipa
+
+      - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Madeira-IPA
-          path: ipa/Madeira-unsigned.ipa
+          name: Madeira-unsigned-IPA
+          path: Madeira-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
