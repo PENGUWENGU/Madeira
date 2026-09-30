@@ -1,258 +1,454 @@
-name: Build Madeira Unsigned IPA
+name: Build Madeira IPA (unsigned)
+
+# Save as .github/workflows/build-ipa.yml, then:
+# Actions -> "Build Madeira IPA (unsigned)" -> Run workflow.
+# Result: artifact "Madeira-IPA" (+ optional GitHub Release with Madeira.ipa).
+# The IPA is not signed with your Apple ID: re-sign/install it with
+# SideStore / AltStore / Sideloadly / LiveContainer.
 
 on:
   workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository to build"
+        type: string
+        default: "PENGUWENGU/Madeira"
+        required: true
+      ref:
+        description: "Branch, tag or commit"
+        type: string
+        default: "main"
+        required: true
+      configuration:
+        description: "Xcode configuration (upstream says Release crashes)"
+        type: choice
+        options: [Debug, Release]
+        default: Debug
+      bundle_vcruntime:
+        description: "Download Microsoft VC++ runtime DLLs into the app"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Also attach the IPA to a GitHub Release"
+        type: boolean
+        default: true
+      clean_cache:
+        description: "Ignore all caches (use if a run fails oddly)"
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: madeira-ipa
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: macos-15-intel
-    timeout-minutes: 360
+    name: Build IPA
+    runs-on: macos-15
+    timeout-minutes: 350
+    env:
+      JOBS: "3"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      # Build-orchestration scripts (willfaust/Madeira PR #14), pinned.
+      SCRIPTS_SHA: ef496822ca427b4b000eaf7c78d3a570e23182e1
+      CACHE_REV: v1
+      SALT: ${{ inputs.clean_cache && github.run_id || 'x' }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Check out ${{ inputs.repo }}@${{ inputs.ref }}
+        uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          path: source
           submodules: recursive
+          persist-credentials: false
 
-      - name: Show environment
+      - name: Select newest Xcode 26 (iOS 26 SDK is required)
+        id: xc
         run: |
-          set -euxo pipefail
-
-          uname -a
-          uname -m
-
-          xcodebuild -version
-          xcode-select -p
-          xcrun --sdk iphoneos --show-sdk-version
-
-      - name: Install dependencies
-        run: |
-          set -euxo pipefail
-
-          brew install \
-            cmake \
-            ninja \
-            meson \
-            pkg-config \
-            autoconf \
-            automake \
-            libtool \
-            nasm \
-            python \
-            gettext \
-            bison \
-            flex
-
-      - name: Install LLVM-MinGW
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          VERSION="20260421"
-          NAME="llvm-mingw-${VERSION}-ucrt-macos-universal"
-
-          mkdir -p "$RUNNER_TEMP/llvm-mingw"
-          cd "$RUNNER_TEMP/llvm-mingw"
-
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-delay 3 \
-            -o llvm-mingw.tar.xz \
-            "https://github.com/mstorsjo/llvm-mingw/releases/download/${VERSION}/${NAME}.tar.xz"
-
-          tar -xf llvm-mingw.tar.xz
-
-          TOOLCHAIN="$RUNNER_TEMP/llvm-mingw/$NAME"
-
-          test -x "$TOOLCHAIN/bin/x86_64-w64-mingw32-clang"
-          test -x "$TOOLCHAIN/bin/x86_64-w64-mingw32-clang++"
-
-          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
-          echo "LLVM_MINGW=$TOOLCHAIN" >> "$GITHUB_ENV"
-
-          "$TOOLCHAIN/bin/x86_64-w64-mingw32-clang" --version
-
-      - name: Verify submodules
-        run: |
-          set -euxo pipefail
-
-          git submodule status
-
-          test -d FEX
-          test -d wine
-          test -d research/dxmt
-
-      - name: Find build scripts
-        run: |
-          set -euxo pipefail
-
-          find build \
-            -type f \
-            -name build.sh \
-            -print \
-            | sort
-
-      - name: Make build scripts executable
-        run: |
-          set -euxo pipefail
-
-          find build \
-            -type f \
-            -name build.sh \
-            -exec chmod +x {} \;
-
-      - name: Build native components
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          export PATH="$LLVM_MINGW/bin:$PATH"
-
-          mapfile -t SCRIPTS < <(
-            find build \
-              -type f \
-              -name build.sh \
-              -print \
-              | sort
-          )
-
-          if [ "${#SCRIPTS[@]}" -eq 0 ]; then
-            echo "ERROR: No build scripts found."
-            exit 1
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n1 || true)"
+          if [[ -z "$XCODE" ]]; then
+            echo "::error::No Xcode 26 on this runner. Installed:"; ls -d /Applications/Xcode*.app; exit 1
           fi
+          echo "DEVELOPER_DIR=$XCODE/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$XCODE/Contents/Developer"
+          xcodebuild -version
+          SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iphoneos SDK: $SDK"
+          [[ "${SDK%%.*}" -ge 26 ]] || { echo "::error::iOS SDK $SDK < 26"; exit 1; }
+          VER="$(xcodebuild -version | awk '/^Xcode/{print $2}')"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "KEYBASE=madeira-$RUNNER_ARCH-xcode$VER-$CACHE_REV-$SALT" >> "$GITHUB_ENV"
+          mkdir -p build-logs
 
-          for script in "${SCRIPTS[@]}"; do
-            echo
-            echo "=============================================="
-            echo "BUILDING: $script"
-            echo "=============================================="
+      - name: Record revisions
+        id: rev
+        run: |
+          echo "src=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "fex=$(git -C FEX rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "wine=$(git -C wine rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "dxmt=$(git -C research/dxmt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git submodule status --recursive | tee build-logs/submodules.txt | head -n 30
 
-            "$GITHUB_WORKSPACE/$script"
+      - name: Fetch pinned build scripts
+        run: |
+          set -euo pipefail
+          O="$RUNNER_TEMP/overlay"; rm -rf "$O"; git init -q "$O"
+          ok=0
+          for url in https://github.com/willfaust/Madeira.git https://github.com/JMRBDev/Madeira.git; do
+            echo "Trying $url"
+            if git -C "$O" fetch --quiet --depth 1 "$url" "$SCRIPTS_SHA"; then ok=1; break; fi
           done
+          [[ $ok == 1 ]] || { echo "::error::could not fetch build scripts $SCRIPTS_SHA"; exit 1; }
+          git -C "$O" archive FETCH_HEAD scripts/build scripts/build-ipa.sh build/wineserver/bootstrap.sh \
+            | tar -x -C .
+          # wineserver/build.sh: only replace it if it still pins a Homebrew Cellar llvm path
+          if grep -q 'Cellar/llvm' build/wineserver/build.sh 2>/dev/null; then
+            git -C "$O" archive FETCH_HEAD build/wineserver/build.sh | tar -x -C .
+            echo "replaced build/wineserver/build.sh"
+          fi
+          chmod +x scripts/build/*.sh scripts/*.sh build/*/*.sh 2>/dev/null || true
+          git status --short | head -n 40
 
-      - name: Check generated libraries
-        shell: bash
+      - name: Apply narrow iOS/CI build fixes
+        env:
+          INPUT_CONFIG: ${{ inputs.configuration }}
         run: |
-          set -euxo pipefail
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
 
-          REQUIRED=(
-            "FEX/build-ios/FEXCore/Source/libFEXCore.a"
-            "FEX/build-ios/FEXCore/Source/libFEXCore_Base.a"
-            "FEX/build-ios/FEXCore/Source/libJemallocLibs.a"
-            "FEX/build-ios/External/fmt/libfmt.a"
-            "FEX/build-ios/External/cephes/libcephes_128bit.a"
-            "FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a"
-            "FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a"
-            "app/libwineserver.a"
-            "app/libntdll_unix.a"
-            "app/libwin32u_unix.a"
-            "app/libdxmt_combined.a"
-            "app/libgnutls.a"
-            "app/libhogweed.a"
-            "app/libnettle.a"
-            "app/libgmp.a"
-          )
+          def note(m): print("[fix]", m)
+          def warn(m): print("::warning::[fix]", m)
 
-          for file in "${REQUIRED[@]}"; do
-            if [ ! -f "$file" ]; then
-              echo "MISSING: $file"
-              exit 1
-            fi
+          def sub_once(path, old, new, label):
+              p = Path(path)
+              if not p.exists():
+                  warn(f"{label}: {path} missing"); return
+              t = p.read_text()
+              if old not in t:
+                  warn(f"{label}: anchor not found (already patched or script differs)"); return
+              if t.count(old) != 1:
+                  warn(f"{label}: anchor found {t.count(old)}x, skipping"); return
+              p.write_text(t.replace(old, new)); note(f"{label}: applied")
 
-            echo "OK: $file"
-          done
+          # 1. FEX: Windows-only diagnostics do not compile for iOS
+          p = Path("FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp")
+          if p.exists():
+              t = p.read_text()
+              s = t.find("MEMORY_BASIC_INFORMATION mbi {};")
+              e = t.find("mbi.Protect, type, mbi.State);", s) if s >= 0 else -1
+              if s < 0:
+                  note("FEX Arm64.cpp: nothing to guard")
+              elif e < 0:
+                  warn("FEX Arm64.cpp: end anchor not found")
+              else:
+                  ls = t.rfind("\n", 0, s) + 1
+                  le = t.find("\n", e)
+                  le = len(t) if le < 0 else le
+                  if "#if defined(_WIN32)" in t[max(0, ls - 60):ls]:
+                      note("FEX Arm64.cpp: already guarded")
+                  else:
+                      t = t[:ls] + "#if defined(_WIN32)\n" + t[ls:le] + "\n#endif" + t[le:]
+                      p.write_text(t); note("FEX Arm64.cpp: guarded")
+          else:
+              warn("FEX Arm64.cpp not found")
 
-      - name: Verify Xcode project
+          # 2. Wine: only host tools + generated headers are needed
+          sub_once("scripts/build/build-wine.sh",
+                   'make -C "$WINE/build-macos" -j"$JOBS"',
+                   'make -C "$WINE/build-macos" -j"$JOBS" __tooldeps__ include/all',
+                   "wine targets")
+
+          # 3. FEX: build only the static libs the app links
+          sub_once("scripts/build/build-fex-ios.sh",
+                   'cmake --build "$BUILD" --parallel "$JOBS"',
+                   'cmake --build "$BUILD" --parallel "$JOBS" --target FEXCore FEXCore_Base fmt cephes_128bit JemallocLibs',
+                   "fex targets")
+          sub_once("scripts/build/build-fex-ios.sh",
+                   'if [[ -f "$OUT" ]]; then',
+                   'if [[ -f "$OUT" && -f "$BUILD/FEXCore/Source/libJemallocLibs.a" ]]; then',
+                   "fex skip check")
+
+          # 4. FreeType wrapper: call through bash
+          sub_once("scripts/build/build-freetype-ios.sh",
+                   '"$ROOT/build/freetype-ios/build.sh"',
+                   'bash "$ROOT/build/freetype-ios/build.sh"',
+                   "freetype bash")
+
+          # 5. LLVM: build only the libs DXMT's airconv links, resumable
+          p = Path("scripts/build/build-llvm-ios.sh")
+          if p.exists():
+              t = p.read_text()
+              t = t.replace("s.replace(old, 'MATCHES \"Darwin|iOS\"', 1)",
+                            "s.replace(old, 'MATCHES \"Darwin|iOS\"')")
+              old = 'if compgen -G "$IOS/lib/libLLVM*.a" >/dev/null; then'
+              if old in t:
+                  t = t.replace(old, 'if [[ -f "$IOS/.madeira-complete-v2" ]]; then')
+              else:
+                  warn("llvm completion check anchor not found")
+              targets = []
+              mb = Path("research/dxmt/src/airconv/meson.build")
+              if mb.exists():
+                  targets = list(dict.fromkeys(re.findall(r"-l(LLVM[A-Za-z0-9_]+)", mb.read_text())))
+              build = 'cmake --build "$IOS" --parallel "$JOBS"'
+              if targets and t.count(build) == 1:
+                  t = t.replace(build, build + " --target " + " ".join(targets))
+                  t += "\n" + "\n".join(f'test -s "$IOS/lib/lib{x}.a"' for x in targets)
+              else:
+                  warn("LLVM target list unavailable: building all LLVM libs (slow)")
+              t += '\ntouch "$IOS/.madeira-complete-v2"\n'
+              p.write_text(t); note(f"llvm script patched ({len(targets)} targets)")
+          else:
+              warn("build-llvm-ios.sh missing")
+
+          # 6. Packaging configuration
+          if os.environ.get("INPUT_CONFIG") == "Debug":
+              p = Path("scripts/build/package-ipa.sh")
+              if p.exists() and "Release" in p.read_text():
+                  p.write_text(p.read_text().replace("Release", "Debug")); note("package-ipa.sh: Debug")
+          PY
+
+      - name: Install build tools
         run: |
-          set -euxo pipefail
+          brew install cmake ninja meson pkg-config autoconf automake libtool bison flex sevenzip llvm
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          command -v xxd
+          xcodebuild -list -project app/Madeira.xcodeproj | head -n 30
 
-          test -d app/Madeira.xcodeproj
-
-          xcodebuild \
-            -project app/Madeira.xcodeproj \
-            -list
-
-      - name: Build Madeira app
-        shell: bash
+      - name: Metal toolchain (Xcode 26 does not bundle it)
         run: |
-          set -euxo pipefail
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            for i in 1 2 3; do
+              xcodebuild -downloadComponent MetalToolchain && break || sleep 20
+            done
+          fi
+          xcrun -sdk macosx metal --version
 
-          rm -rf "$RUNNER_TEMP/MadeiraDerivedData"
-
-          xcodebuild \
-            -project app/Madeira.xcodeproj \
-            -target Madeira \
-            -configuration Release \
-            -sdk iphoneos \
-            -arch arm64 \
-            -derivedDataPath "$RUNNER_TEMP/MadeiraDerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" \
-            ONLY_ACTIVE_ARCH=NO \
-            build
-
-      - name: Verify Madeira.app
-        shell: bash
+      - name: Microsoft VC++ runtime DLLs
+        if: inputs.bundle_vcruntime
         run: |
-          set -euxo pipefail
+          python3 - <<'PY'
+          import os, re, shutil, subprocess, sys
+          from pathlib import Path
 
-          APP="$RUNNER_TEMP/MadeiraDerivedData/Build/Products/Release-iphoneos/Madeira.app"
+          WANTED = ["concrt140.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+                    "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll", "vcamp140.dll",
+                    "vccorlib140.dll", "vcomp140.dll", "vcruntime140.dll",
+                    "vcruntime140_1.dll", "vcruntime140_threads.dll"]
+          URLS = ["https://aka.ms/vs/17/release/vc_redist.x64.exe",
+                  "https://aka.ms/vc14/vc_redist.x64.exe"]
+          dest = Path("app/Madeira/x86_64-vcruntime"); dest.mkdir(parents=True, exist_ok=True)
+          work = Path(os.environ["RUNNER_TEMP"]) / "vcredist"
+          shutil.rmtree(work, ignore_errors=True); work.mkdir(parents=True)
+          exe = work / "vc_redist.x64.exe"
 
-          test -d "$APP"
-          test -f "$APP/Madeira"
+          def warn(m): print("::warning::" + m)
 
-          file "$APP/Madeira"
-          lipo -info "$APP/Madeira"
+          got = False
+          for u in URLS:
+              r = subprocess.run(["curl", "-fsSL", "--retry", "5", "--retry-delay", "3", "-o", str(exe), u])
+              if r.returncode == 0 and exe.stat().st_size > 1_000_000:
+                  got = True; break
+          if not got:
+              warn("could not download the VC++ redistributable; continuing without it"); sys.exit(0)
 
-          echo "APP=$APP" >> "$GITHUB_ENV"
+          def extract(src, out):
+              out.mkdir(parents=True, exist_ok=True)
+              return subprocess.run(["7zz", "x", "-y", "-bso0", "-bsp0", f"-o{out}", str(src)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
-      - name: Create unsigned IPA
-        shell: bash
-        run: |
-          set -euxo pipefail
+          root = work / "x"
+          extract(exe, root)
+          SKIP = {".png", ".xml", ".thm", ".wxl", ".txt", ".rtf", ".html", ".htm", ".ico",
+                  ".bmp", ".json", ".manifest", ".mst", ".lib", ".pdb", ".sys"}
+          tried, attempts = set(), 0
+          for _ in range(6):
+              cands = [p for p in root.rglob("*")
+                       if p.is_file() and p not in tried and p.suffix.lower() not in SKIP
+                       and ".dll" not in p.name.lower() and p.stat().st_size > 2048]
+              if not cands or attempts > 300:
+                  break
+              for p in cands:
+                  tried.add(p); attempts += 1
+                  extract(p, p.parent / (p.name + ".d"))
 
-          rm -rf "$RUNNER_TEMP/Payload"
-          mkdir -p "$RUNNER_TEMP/Payload"
+          def is_amd64(p):
+              d = open(p, "rb").read(65536)
+              if d[:2] != b"MZ": return False
+              off = int.from_bytes(d[0x3c:0x40], "little")
+              return d[off:off + 4] == b"PE\0\0" and int.from_bytes(d[off + 4:off + 6], "little") == 0x8664
 
-          cp -R "$APP" "$RUNNER_TEMP/Payload/Madeira.app"
+          found = {}
+          for p in root.rglob("*"):
+              if not p.is_file(): continue
+              m = re.match(r"^(.+?\.dll)(?:[_.].*)?$", p.name, re.I)
+              if m and m.group(1).lower() in WANTED and m.group(1).lower() not in found and is_amd64(p):
+                  found[m.group(1).lower()] = p
+          for n, p in found.items():
+              shutil.copy2(p, dest / n)
+          missing = [n for n in WANTED if n not in found]
+          print(f"VC runtime: {len(found)}/12 found")
+          if missing:
+              warn("VC runtime DLLs missing: " + ", ".join(missing))
+              for p in root.rglob("*140*"): print("  seen:", p.relative_to(root))
+          PY
 
-          cd "$RUNNER_TEMP"
+      - name: Prefix template check
+        continue-on-error: true
+        run: bash tools/check-prefix-template.sh app/Madeira/prefix-template.tar.gz
 
-          /usr/bin/zip \
-            -qry \
-            "$GITHUB_WORKSPACE/Madeira-unsigned.ipa" \
-            Payload
+      - name: llvm-mingw toolchain
+        run: bash scripts/build/setup-llvm-mingw.sh 2>&1 | tee build-logs/llvm-mingw.log
 
-          test -f "$GITHUB_WORKSPACE/Madeira-unsigned.ipa"
-
-      - name: Validate IPA
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          unzip -t Madeira-unsigned.ipa
-
-          unzip -l Madeira-unsigned.ipa | grep "Payload/Madeira.app/"
-
-          echo
-          echo "=============================================="
-          echo "SUCCESS"
-          echo "=============================================="
-
-          ls -lh Madeira-unsigned.ipa
-
-      - name: Upload unsigned IPA
-        uses: actions/upload-artifact@v4
+      # ---- Wine host tools + generated headers -------------------------------
+      - name: Cache Wine host trees
+        id: wine-cache
+        uses: actions/cache@v4
         with:
-          name: Madeira-unsigned-IPA
-          path: Madeira-unsigned.ipa
-          if-no-files-found: error
+          path: |
+            source/wine/build-macos
+            source/wine/build-arm64ec
+          key: ${{ env.KEYBASE }}-wine-${{ steps.rev.outputs.wine }}-${{ hashFiles('source/scripts/build/build-wine.sh') }}
+      - name: Build Wine host tools
+        if: steps.wine-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build/build-wine.sh 2>&1 | tee build-logs/wine.log
+
+      # ---- FEX ---------------------------------------------------------------
+      - name: Cache FEX iOS build
+        id: fex-cache
+        uses: actions/cache@v4
+        with:
+          path: source/FEX/build-ios
+          key: ${{ env.KEYBASE }}-fex-${{ steps.rev.outputs.fex }}-${{ hashFiles('source/scripts/build/build-fex-ios.sh') }}
+      - name: Build FEX
+        if: steps.fex-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build/build-fex-ios.sh 2>&1 | tee build-logs/fex.log
+
+      # ---- FreeType, GnuTLS, Wine unix libs -----------------------------------
+      - name: Cache support libraries
+        id: support-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            source/app/Madeira/libgmp.a
+            source/app/Madeira/libnettle.a
+            source/app/Madeira/libhogweed.a
+            source/app/Madeira/libgnutls.a
+            source/app/Madeira/libwineserver.a
+            source/app/Madeira/libntdll_unix.a
+            source/app/Madeira/libwin32u_unix.a
+          key: ${{ env.KEYBASE }}-support-${{ steps.rev.outputs.wine }}-${{ hashFiles('source/build/gnutls-ios/build.sh', 'source/build/wineserver/*.sh', 'source/build/ntdll-unix/build.sh', 'source/build/win32u-unix/build.sh', 'source/scripts/build/build-freetype-ios.sh', 'source/scripts/build/sync-gnutls-libs.sh') }}
+      - name: Build FreeType, GnuTLS and Wine unix libraries
+        if: steps.support-cache.outputs.cache-hit != 'true'
+        run: |
+          {
+            bash scripts/build/build-freetype-ios.sh
+            bash build/gnutls-ios/build.sh
+            bash scripts/build/sync-gnutls-libs.sh
+            bash build/wineserver/bootstrap.sh
+            bash build/wineserver/build.sh
+            bash build/ntdll-unix/build.sh
+            bash build/win32u-unix/build.sh
+          } 2>&1 | tee build-logs/support-libs.log
+
+      # ---- LLVM 15 for iOS (resumable across failed runs) ---------------------
+      - name: Restore LLVM cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            source/toolchains/llvm-project
+            source/toolchains/llvm-host-build
+            source/toolchains/llvm-ios-build
+          key: ${{ env.KEYBASE }}-llvm-${{ github.run_id }}
+          restore-keys: ${{ env.KEYBASE }}-llvm-
+      - name: LLVM already complete?
+        id: llvm-pre
+        run: |
+          if [[ -f toolchains/llvm-ios-build/.madeira-complete-v2 ]]; then echo complete=true; else echo complete=false; fi >> "$GITHUB_OUTPUT"
+      - name: Build LLVM for iOS
+        id: llvm
+        run: bash scripts/build/build-llvm-ios.sh 2>&1 | tee build-logs/llvm.log
+      - name: Save LLVM cache
+        if: always() && steps.llvm-pre.outputs.complete != 'true' && (steps.llvm.outcome == 'success' || steps.llvm.outcome == 'failure')
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            source/toolchains/llvm-project
+            source/toolchains/llvm-host-build
+            source/toolchains/llvm-ios-build
+          key: ${{ env.KEYBASE }}-llvm-${{ github.run_id }}
+
+      # ---- DXMT ----------------------------------------------------------------
+      - name: Build Metal shader headers and DXMT
+        run: |
+          {
+            bash scripts/build/build-shader-headers.sh
+            bash scripts/build/build-dxmt-ios.sh
+          } 2>&1 | tee build-logs/dxmt.log
+
+      # ---- App + IPA -----------------------------------------------------------
+      - name: Package IPA
+        run: |
+          if [[ -f build/stage-licenses.sh ]]; then
+            bash build/stage-licenses.sh || echo "::warning::stage-licenses.sh failed"
+          fi
+          bash scripts/build/package-ipa.sh 2>&1 | tee build-logs/package.log
+          IPA="$(ls dist/*.ipa 2>/dev/null | head -n1 || true)"
+          [[ -n "$IPA" ]] || { echo "::error::no IPA produced in dist/"; exit 1; }
+          [[ "$IPA" == dist/Madeira.ipa ]] || cp "$IPA" dist/Madeira.ipa
+          (cd dist && shasum -a 256 Madeira.ipa > Madeira.ipa.sha256)
+          {
+            echo "Source: ${{ inputs.repo }}@${{ inputs.ref }} (${{ steps.rev.outputs.src }})"
+            echo "FEX: ${{ steps.rev.outputs.fex }}"
+            echo "Wine: ${{ steps.rev.outputs.wine }}"
+            echo "DXMT: ${{ steps.rev.outputs.dxmt }}"
+            echo "Xcode: ${{ steps.xc.outputs.version }}  Configuration: ${{ inputs.configuration }}"
+            echo "SHA-256: $(cut -d' ' -f1 dist/Madeira.ipa.sha256)"
+            echo
+            echo "Not signed with an Apple ID. Re-sign/install with SideStore, AltStore, Sideloadly or LiveContainer."
+          } | tee dist/BUILD-INFO.txt >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v5
+        with:
+          name: Madeira-IPA
+          path: |
+            source/dist/Madeira.ipa
+            source/dist/Madeira.ipa.sha256
+            source/dist/BUILD-INFO.txt
           retention-days: 14
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: Madeira-build-logs
+          path: source/build-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse --short HEAD)"
+          TAG="ipa-$(date -u +%Y%m%d-%H%M%S)-$SHA"
+          gh release create "$TAG" dist/Madeira.ipa dist/Madeira.ipa.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "Madeira IPA $SHA" \
+            --notes-file dist/BUILD-INFO.txt --prerelease
